@@ -70,10 +70,8 @@ def seconds_to_srt_time(seconds_float: float) -> str:
 
 def clean_llm_srt_output(raw_text: str) -> str:
     text = raw_text.strip()
-    text = re.sub(r"^```(?:srt|plaintext|text)?\s*
-?", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"
-?```\s*$", "", text)
+    text = re.sub(r"^```(?:srt|plaintext|text)?\s*\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n?```\s*$", "", text)
     return text.strip()
 
 
@@ -165,18 +163,13 @@ def run_groq_whisper_original_srt(
                     start_ms = int(round(float(seg_start) * 1000)) + offset_ms
                     end_ms = int(round(float(seg_end) * 1000)) + offset_ms
 
-                    block = f"{idx}
-{ms_to_srt_time(start_ms)} --> {ms_to_srt_time(end_ms)}
-{seg_text}"
+                    block = f"{idx}\n{ms_to_srt_time(start_ms)} --> {ms_to_srt_time(end_ms)}\n{seg_text}"
                     all_blocks.append(block)
                     idx += 1
 
                 # Save intermediate progress after each chunk
                 with open(output_srt, "w", encoding="utf-8") as f:
-                    f.write("
-
-".join(all_blocks) + "
-")
+                    f.write("\n\n".join(all_blocks) + "\n")
                 break
 
             except Exception as e:
@@ -229,12 +222,8 @@ def run_local_whisper_original_srt(job_id: str, audio_path: str, output_srt: str
                 continue
             start_ts = seconds_to_srt_time(seg.start)
             end_ts = seconds_to_srt_time(seg.end)
-            block = f"{idx}
-{start_ts} --> {end_ts}
-{text}"
-            f.write(block + "
-
-")
+            block = f"{idx}\n{start_ts} --> {end_ts}\n{text}"
+            f.write(block + "\n\n")
             f.flush()
 
             pct = min(95, int((seg.end / total_dur) * 100))
@@ -262,18 +251,14 @@ def translate_srt_with_groq(
     with open(input_srt, "r", encoding="utf-8-sig") as f:
         content = f.read().strip()
 
-    blocks = re.split(r"
-\s*
-", content)
+    blocks = re.split(r"\n\s*\n", content)
     total_blocks = len(blocks)
     batch_size = 40  # Smaller batch size for Groq token limits and faster responses
     translated_batches: List[str] = []
 
     for start in range(0, total_blocks, batch_size):
         batch = blocks[start : start + batch_size]
-        batch_text = "
-
-".join(batch)
+        batch_text = "\n\n".join(batch)
         batch_num = (start // batch_size) + 1
         total_batches = (total_blocks + batch_size - 1) // batch_size
 
@@ -282,15 +267,11 @@ def translate_srt_with_groq(
 
         user_prompt = (
             "Translate the following .srt subtitle blocks into natural colloquial Burmese (Myanmar Unicode). "
-            "Keep the exact index numbers and timestamps unchanged:
-
-"
+            "Keep the exact index numbers and timestamps unchanged:\n\n"
             f"{batch_text}"
         )
         if hint:
-            user_prompt = f"Movie Context: {hint}
-
-" + user_prompt
+            user_prompt = f"Movie Context: {hint}\n\n" + user_prompt
 
         for attempt in range(1, 4):
             try:
@@ -311,10 +292,7 @@ def translate_srt_with_groq(
                 time.sleep(3 * attempt)
 
         with open(output_srt, "w", encoding="utf-8") as f:
-            f.write("
-
-".join(translated_batches) + "
-")
+            f.write("\n\n".join(translated_batches) + "\n")
 
 
 def translate_srt_with_gemini(
@@ -333,18 +311,14 @@ def translate_srt_with_gemini(
     with open(input_srt, "r", encoding="utf-8-sig") as f:
         content = f.read().strip()
 
-    blocks = re.split(r"
-\s*
-", content)
+    blocks = re.split(r"\n\s*\n", content)
     total_blocks = len(blocks)
     batch_size = 60
     translated_batches: List[str] = []
 
     for start in range(0, total_blocks, batch_size):
         batch = blocks[start : start + batch_size]
-        batch_text = "
-
-".join(batch)
+        batch_text = "\n\n".join(batch)
         batch_num = (start // batch_size) + 1
         total_batches = (total_blocks + batch_size - 1) // batch_size
 
@@ -353,15 +327,11 @@ def translate_srt_with_gemini(
 
         prompt = (
             "Translate the following .srt subtitle blocks into natural colloquial Burmese (Myanmar Unicode). "
-            "Keep the exact index numbers and timestamps unchanged:
-
-"
+            "Keep the exact index numbers and timestamps unchanged:\n\n"
             f"{batch_text}"
         )
         if hint:
-            prompt = f"Movie Context: {hint}
-
-" + prompt
+            prompt = f"Movie Context: {hint}\n\n" + prompt
 
         for attempt in range(1, 4):
             try:
@@ -381,10 +351,7 @@ def translate_srt_with_gemini(
                 time.sleep(3 * attempt)
 
         with open(output_srt, "w", encoding="utf-8") as f:
-            f.write("
-
-".join(translated_batches) + "
-")
+            f.write("\n\n".join(translated_batches) + "\n")
 
 
 # =====================================================================
