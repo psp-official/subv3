@@ -7,7 +7,7 @@ Supports:
 1. Groq API (whisper-large-v3-turbo / whisper-large-v3) -> Ultra-fast Original .SRT (Low RAM on Render!)
 2. Local Faster-Whisper (No API Key)                    -> Free Original .SRT on CPU
 3. Groq LLM (llama-3.3-70b-versatile)                   -> Myanmar .SRT Translation using Groq API Key
-4. Gemini API (gemini-2.5-flash)                        -> Natural Myanmar .SRT Translation
+4. Gemini API (gemini-3.8-flash)                        -> Natural Myanmar .SRT Translation
 """
 
 import os
@@ -300,7 +300,7 @@ def translate_srt_with_gemini(
     input_srt: str,
     output_srt: str,
     gemini_api_key: str,
-    gemini_model: str = "gemini-2.5-flash",
+    gemini_model: str = "gemini-3.8-flash",
     hint: str = ""
 ):
     """Translate Original .srt blocks into Myanmar Unicode using Gemini API."""
@@ -379,7 +379,7 @@ def background_worker(job_id: str, params: Dict[str, Any]):
             if translate_engine == "groq_llm":
                 translate_srt_with_groq(job_id, str(input_path), mm_srt, groq_api_key, "llama-3.3-70b-versatile", hint)
             else:
-                translate_srt_with_gemini(job_id, str(input_path), mm_srt, gemini_api_key, "gemini-2.5-flash", hint)
+                translate_srt_with_gemini(job_id, str(input_path), mm_srt, gemini_api_key, "gemini-3.8-flash", hint)
             JOBS[job_id]["mm_srt"] = mm_srt
 
         # Case 2: Video/Audio input
@@ -419,7 +419,7 @@ def background_worker(job_id: str, params: Dict[str, Any]):
                 if translate_engine == "groq_llm":
                     translate_srt_with_groq(job_id, orig_srt, mm_srt, groq_api_key, "llama-3.3-70b-versatile", hint)
                 else:
-                    translate_srt_with_gemini(job_id, orig_srt, mm_srt, gemini_api_key, "gemini-2.5-flash", hint)
+                    translate_srt_with_gemini(job_id, orig_srt, mm_srt, gemini_api_key, "gemini-3.8-flash", hint)
                 JOBS[job_id]["mm_srt"] = mm_srt
 
         JOBS[job_id]["status"] = "completed"
