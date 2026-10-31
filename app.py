@@ -83,10 +83,8 @@ def seconds_to_srt_time(seconds_float: float) -> str:
 
 def clean_llm_srt_output(raw_text: str) -> str:
     text = raw_text.strip()
-    text = re.sub(r"^```(?:srt|plaintext|text)?\s*
-?", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"
-?```\s*$", "", text)
+    text = re.sub(r"^```(?:srt|plaintext|text)?\s*\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\n?```\s*$", "", text)
     return text.strip()
 
 
@@ -95,9 +93,7 @@ def parse_and_offset_srt(srt_text: str, offset_ms: int, start_index: int = 1) ->
     if not cleaned:
         return [], start_index
 
-    blocks = re.split(r"
-\s*
-", cleaned)
+    blocks = re.split(r"\n\s*\n", cleaned)
     formatted_blocks = []
     current_idx = start_index
 
@@ -127,12 +123,9 @@ def parse_and_offset_srt(srt_text: str, offset_ms: int, start_index: int = 1) ->
         end_time_ms = time_to_ms(h2, m2, s2, ms2) + offset_ms
 
         new_ts_line = f"{ms_to_srt_time(start_time_ms)} --> {ms_to_srt_time(end_time_ms)}"
-        dialogue_text = "
-".join(dialogue_lines)
+        dialogue_text = "\n".join(dialogue_lines)
 
-        formatted_blocks.append(f"{current_idx}
-{new_ts_line}
-{dialogue_text}")
+        formatted_blocks.append(f"{current_idx}\n{new_ts_line}\n{dialogue_text}")
         current_idx += 1
 
     return formatted_blocks, current_idx
@@ -196,12 +189,8 @@ def run_whisper_original_srt(job_id: str, audio_path: str, output_srt: str, mode
                 continue
             start_ts = seconds_to_srt_time(seg.start)
             end_ts = seconds_to_srt_time(seg.end)
-            block = f"{idx}
-{start_ts} --> {end_ts}
-{text}"
-            f.write(block + "
-
-")
+            block = f"{idx}\n{start_ts} --> {end_ts}\n{text}"
+            f.write(block + "\n\n")
             f.flush()
 
             pct = min(95, int((seg.end / total_dur) * 100))
@@ -218,18 +207,14 @@ def run_gemini_srt_translation(job_id: str, input_srt: str, output_srt: str, api
     with open(input_srt, "r", encoding="utf-8-sig") as f:
         content = f.read().strip()
 
-    blocks = re.split(r"
-\s*
-", content)
+    blocks = re.split(r"\n\s*\n", content)
     total_blocks = len(blocks)
     batch_size = 60
     translated_batches: List[str] = []
 
     for start in range(0, total_blocks, batch_size):
         batch = blocks[start : start + batch_size]
-        batch_text = "
-
-".join(batch)
+        batch_text = "\n\n".join(batch)
         batch_num = (start // batch_size) + 1
         total_batches = (total_blocks + batch_size - 1) // batch_size
 
@@ -238,15 +223,11 @@ def run_gemini_srt_translation(job_id: str, input_srt: str, output_srt: str, api
 
         prompt = (
             "Translate the following .srt subtitle blocks into natural colloquial Burmese (Myanmar Unicode). "
-            "Keep the exact index numbers and timestamps unchanged:
-
-"
+            "Keep the exact index numbers and timestamps unchanged:\n\n"
             f"{batch_text}"
         )
         if hint:
-            prompt = f"Movie Context: {hint}
-
-" + prompt
+            prompt = f"Movie Context: {hint}\n\n" + prompt
 
         for attempt in range(1, 4):
             try:
@@ -266,10 +247,7 @@ def run_gemini_srt_translation(job_id: str, input_srt: str, output_srt: str, api
                 time.sleep(3 * attempt)
 
         with open(output_srt, "w", encoding="utf-8") as f:
-            f.write("
-
-".join(translated_batches) + "
-")
+            f.write("\n\n".join(translated_batches) + "\n")
 
 
 def run_gemini_direct_video_to_mm(job_id: str, audio_path: str, work_dir: Path, output_srt: str, api_key: str, model_name: str, hint: str):
@@ -307,8 +285,7 @@ def run_gemini_direct_video_to_mm(job_id: str, audio_path: str, work_dir: Path, 
                 "for all spoken dialogue in this audio clip. Start timestamps from 00:00:00,000."
             )
             if hint:
-                prompt += f"
-Context: {hint}"
+                prompt += f"\nContext: {hint}"
 
             resp = client.models.generate_content(
                 model=model_name,
@@ -322,10 +299,7 @@ Context: {hint}"
             all_blocks.extend(adj_blocks)
 
             with open(output_srt, "w", encoding="utf-8") as f:
-                f.write("
-
-".join(all_blocks) + "
-")
+                f.write("\n\n".join(all_blocks) + "\n")
         finally:
             try:
                 client.files.delete(name=uploaded.name)
@@ -551,7 +525,7 @@ def start_job():
     whisper_model = request.form.get("whisper_model", os.environ.get("WHISPER_MODEL", "small"))
     lang = request.form.get("lang", "")
     hint = request.form.get("hint", "")
-    gemini_model = request.form.get("gemini_model", "gemini-3.8-flash")
+    gemini_model = request.form.get("gemini_model", "gemini-2.5-flash")
     api_key = request.form.get("api_key", "").strip() or os.environ.get("GEMINI_API_KEY", "")
 
     orig_path = Path(f.filename)
