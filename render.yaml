@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: mm-subtitle-generator
+    runtime: docker
+    plan: standard # Paid Plan: 'starter' (512MB RAM) or 'standard' (2GB RAM - recommended for Whisper small)
+    healthCheckPath: /health
+    envVars:
+      - key: WHISPER_MODEL
+        value: small
+      - key: WHISPER_THREADS
+        value: "4"
+      - key: GEMINI_API_KEY
+        sync: false
