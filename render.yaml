@@ -1,13 +1,11 @@
 services:
   - type: web
-    name: mm-subtitle-generator
+    name: mm-subtitle-generator-v2
     runtime: docker
-    plan: standard # Paid Plan: 'starter' (512MB RAM) or 'standard' (2GB RAM - recommended for Whisper small)
+    plan: starter # Groq API သုံးပါက Starter ($7/mo - 512MB RAM) နဲ့တင် အလွန်မြန်ဆန်စွာ အလုပ်လုပ်ပါသည်
     healthCheckPath: /health
     envVars:
-      - key: WHISPER_MODEL
-        value: small
-      - key: WHISPER_THREADS
-        value: "4"
+      - key: GROQ_API_KEY
+        sync: false
       - key: GEMINI_API_KEY
         sync: false
