@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Render Paid Plan - Subtitle Generator Web Service (app.py)
-==========================================================
-- Mode 1 (original): API Key မလိုဘဲ Faster-Whisper (int8 CPU optimized) ဖြင့် မူရင်းဘာသာ .srt ထုတ်ပေးသည်။
-- Mode 2 (myanmar) : Gemini API ဖြင့် မြန်မာစာတန်းထိုး (.srt) တိုက်ရိုက်ထုတ်ပေးသည်။
-- Mode 3 (both)    : Faster-Whisper ဖြင့် မူရင်း .srt အရင်ထုတ်ပြီး Gemini API ဖြင့် မြန်မာ .srt သို့ ဘာသာပြန်ပေးသည်။
-- Render Cloudflare HTTP 100s Timeout မဖြစ်စေရန် Background Job Queue + Live Progress Polling စနစ် ပါဝင်သည်။
+Render Paid Plan - Subtitle Generator Web Service v2 (app-v2.py)
+================================================================
+Supports:
+1. Groq API (whisper-large-v3-turbo / whisper-large-v3) -> Ultra-fast Original .SRT (Low RAM on Render!)
+2. Local Faster-Whisper (No API Key)                    -> Free Original .SRT on CPU
+3. Groq LLM (llama-3.3-70b-versatile)                   -> Myanmar .SRT Translation using Groq API Key
+4. Gemini API (gemini-2.5-flash)                        -> Natural Myanmar .SRT Translation
 """
 
 import os
@@ -14,7 +15,6 @@ import re
 import uuid
 import time
 import glob
-import shutil
 import tempfile
 import threading
 import subprocess
@@ -23,40 +23,27 @@ from typing import Dict, Any, List, Tuple
 from flask import Flask, request, jsonify, send_file, render_template_string
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB max upload
 
-# Render Paid Plan တွင် ဗီဒီယိုဖိုင်အကြီးများ တင်နိုင်ရန် (Max 500MB)
-app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
-
-JOBS_DIR = Path(tempfile.gettempdir()) / "render_sub_jobs"
+JOBS_DIR = Path(tempfile.gettempdir()) / "render_sub_jobs_v2"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-# In-memory job store (Use 1 Gunicorn worker with multiple threads on Render)
 JOBS: Dict[str, Dict[str, Any]] = {}
 WHISPER_CACHE: Dict[str, Any] = {}
 WHISPER_LOCK = threading.Lock()
 
 # =====================================================================
-# 1. SYSTEM PROMPTS FOR GEMINI MYANMAR TRANSLATION
+# 1. SYSTEM PROMPTS FOR MYANMAR TRANSLATION (GROQ & GEMINI)
 # =====================================================================
-
-AUDIO_TO_MM_SRT_SYSTEM_PROMPT = """# Role & Objective
-You are an elite Multimodal Subtitle Generator and Audiovisual Translator.
-Your mission is to listen to the uploaded foreign movie/series/donghua audio clip, accurately transcribe the spoken dialogue with precise timestamps, and translate it directly into **short, punchy, natural, and culturally accurate Burmese (Myanmar Unicode)** in standard `.srt` format.
-
-# Core Rules (CRITICAL)
-1. Output ONLY valid `.srt` subtitle blocks. Do NOT include markdown code blocks (no ```srt).
-2. Sync start and end timestamps (`HH:MM:SS,mmm --> HH:MM:SS,mmm`) strictly with actual spoken dialogue.
-3. Use natural spoken Burmese suited to the character's tone and relationship.
-4. Always use standard Myanmar Unicode (NOT Zawgyi).
-"""
 
 SRT_TRANSLATE_SYSTEM_PROMPT = """# Role & Objective
 You are a professional Movie Subtitle Translator specializing in translating foreign `.srt` subtitles into **natural, colloquial Burmese (Myanmar Unicode)**.
 
 # Core Rules (CRITICAL)
 1. Keep the exact subtitle index numbers and timestamps (`HH:MM:SS,mmm --> HH:MM:SS,mmm`) unchanged.
-2. Translate ONLY the dialogue text into natural spoken Burmese.
-3. Return ONLY the valid `.srt` blocks without markdown fences or extra commentary.
+2. Translate ONLY the dialogue text into natural spoken Burmese suited to the character's tone (e.g., ကျွန်တော်/ခင်ဗျား, ငါ/မင်း, ရှင်/ကျွန်မ).
+3. Return ONLY the valid `.srt` blocks without markdown code fences or extra commentary.
+4. Use 100% standard Myanmar Unicode (NOT Zawgyi).
 """
 
 TIMESTAMP_REGEX = re.compile(
@@ -83,60 +70,19 @@ def seconds_to_srt_time(seconds_float: float) -> str:
 
 def clean_llm_srt_output(raw_text: str) -> str:
     text = raw_text.strip()
-    text = re.sub(r"^```(?:srt|plaintext|text)?\s*\n?", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\n?```\s*$", "", text)
+    text = re.sub(r"^```(?:srt|plaintext|text)?\s*
+?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"
+?```\s*$", "", text)
     return text.strip()
 
 
-def parse_and_offset_srt(srt_text: str, offset_ms: int, start_index: int = 1) -> Tuple[List[str], int]:
-    cleaned = clean_llm_srt_output(srt_text)
-    if not cleaned:
-        return [], start_index
-
-    blocks = re.split(r"\n\s*\n", cleaned)
-    formatted_blocks = []
-    current_idx = start_index
-
-    for block in blocks:
-        lines = [line.strip() for line in block.strip().splitlines() if line.strip()]
-        if len(lines) < 2:
-            continue
-
-        ts_line_idx = -1
-        match = None
-        for i, line in enumerate(lines):
-            m = TIMESTAMP_REGEX.search(line)
-            if m:
-                ts_line_idx = i
-                match = m
-                break
-
-        if ts_line_idx == -1 or not match:
-            continue
-
-        dialogue_lines = lines[ts_line_idx + 1 :]
-        if not dialogue_lines:
-            continue
-
-        h1, m1, s1, ms1, h2, m2, s2, ms2 = map(int, match.groups())
-        start_time_ms = time_to_ms(h1, m1, s1, ms1) + offset_ms
-        end_time_ms = time_to_ms(h2, m2, s2, ms2) + offset_ms
-
-        new_ts_line = f"{ms_to_srt_time(start_time_ms)} --> {ms_to_srt_time(end_time_ms)}"
-        dialogue_text = "\n".join(dialogue_lines)
-
-        formatted_blocks.append(f"{current_idx}\n{new_ts_line}\n{dialogue_text}")
-        current_idx += 1
-
-    return formatted_blocks, current_idx
-
-
 # =====================================================================
-# 2. FFMPEG & FASTER-WHISPER HELPERS (RENDER PAID PLAN OPTIMIZED)
+# 2. FFMPEG AUDIO EXTRACTION & CHUNKING (FOR GROQ 25MB LIMIT & LOCAL)
 # =====================================================================
 
 def extract_lightweight_audio(input_media: str, output_mp3: str):
-    """Extract 16kHz Mono MP3 via FFmpeg to minimize RAM usage on Render."""
+    """Extract 16kHz Mono 64kbps MP3 (~4.8MB per 10 mins) via FFmpeg."""
     cmd = [
         "ffmpeg", "-y", "-i", input_media,
         "-vn", "-ac", "1", "-ar", "16000", "-b:a", "64k",
@@ -147,8 +93,103 @@ def extract_lightweight_audio(input_media: str, output_mp3: str):
         raise RuntimeError(f"FFmpeg audio extraction failed: {res.stderr}")
 
 
-def get_whisper_model(model_size: str = "small"):
-    """Singleton pattern to keep Faster-Whisper loaded in RAM across requests."""
+def split_audio_into_chunks(audio_mp3: str, work_dir: Path, chunk_seconds: int = 600) -> List[Tuple[str, int]]:
+    """Split extracted MP3 into 10-minute chunks (~4.8MB each) so Groq API never hits the 25MB limit."""
+    pattern = str(work_dir / "chunk_%04d.mp3")
+    cmd = [
+        "ffmpeg", "-y", "-i", audio_mp3,
+        "-f", "segment", "-segment_time", str(chunk_seconds),
+        "-c", "copy", pattern
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"FFmpeg segmenting failed: {res.stderr}")
+
+    chunk_files = sorted(glob.glob(str(work_dir / "chunk_*.mp3")))
+    return [(fpath, idx * chunk_seconds * 1000) for idx, fpath in enumerate(chunk_files)]
+
+
+# =====================================================================
+# 3. GROQ WHISPER API (ULTRA-FAST ORIGINAL .SRT GENERATION)
+# =====================================================================
+
+def run_groq_whisper_original_srt(
+    job_id: str,
+    audio_mp3: str,
+    work_dir: Path,
+    output_srt: str,
+    groq_api_key: str,
+    groq_whisper_model: str = "whisper-large-v3-turbo",
+    lang_code: str = ""
+):
+    """
+    Use Groq Cloud Whisper API (whisper-large-v3-turbo or whisper-large-v3)
+    to transcribe audio chunks into frame-accurate Original Language .srt.
+    """
+    from groq import Groq
+
+    client = Groq(api_key=groq_api_key)
+    chunks = split_audio_into_chunks(audio_mp3, work_dir, chunk_seconds=600)
+
+    all_blocks: List[str] = []
+    idx = 1
+
+    for c_i, (chunk_path, offset_ms) in enumerate(chunks, start=1):
+        JOBS[job_id]["message"] = f"Groq {groq_whisper_model} ဖြင့် မူရင်းစာတန်းထိုး ထုတ်နေပါသည် (Chunk {c_i}/{len(chunks)})..."
+        JOBS[job_id]["progress"] = min(90, int(((c_i - 1) / max(len(chunks), 1)) * 90) + 10)
+
+        for attempt in range(1, 4):
+            try:
+                with open(chunk_path, "rb") as audio_file:
+                    kwargs: Dict[str, Any] = {
+                        "file": (os.path.basename(chunk_path), audio_file.read()),
+                        "model": groq_whisper_model,
+                        "response_format": "verbose_json",
+                        "timestamp_granularities": ["segment"],
+                        "temperature": 0.0,
+                    }
+                    if lang_code and lang_code.strip():
+                        kwargs["language"] = lang_code.strip()
+
+                    transcription = client.audio.transcriptions.create(**kwargs)
+
+                segments = getattr(transcription, "segments", None) or []
+                for seg in segments:
+                    seg_start = seg.get("start", 0.0) if isinstance(seg, dict) else getattr(seg, "start", 0.0)
+                    seg_end = seg.get("end", 0.0) if isinstance(seg, dict) else getattr(seg, "end", 0.0)
+                    seg_text = (seg.get("text", "") if isinstance(seg, dict) else getattr(seg, "text", "")).strip()
+
+                    if not seg_text:
+                        continue
+
+                    start_ms = int(round(float(seg_start) * 1000)) + offset_ms
+                    end_ms = int(round(float(seg_end) * 1000)) + offset_ms
+
+                    block = f"{idx}
+{ms_to_srt_time(start_ms)} --> {ms_to_srt_time(end_ms)}
+{seg_text}"
+                    all_blocks.append(block)
+                    idx += 1
+
+                # Save intermediate progress after each chunk
+                with open(output_srt, "w", encoding="utf-8") as f:
+                    f.write("
+
+".join(all_blocks) + "
+")
+                break
+
+            except Exception as e:
+                if attempt == 3:
+                    raise RuntimeError(f"Groq Whisper API Error on chunk {c_i}: {e}")
+                time.sleep(3 * attempt)
+
+
+# =====================================================================
+# 4. LOCAL FASTER-WHISPER (NO API KEY FALLBACK)
+# =====================================================================
+
+def get_local_whisper_model(model_size: str = "small"):
     with WHISPER_LOCK:
         if model_size not in WHISPER_CACHE:
             from faster_whisper import WhisperModel
@@ -163,11 +204,11 @@ def get_whisper_model(model_size: str = "small"):
         return WHISPER_CACHE[model_size]
 
 
-def run_whisper_original_srt(job_id: str, audio_path: str, output_srt: str, model_size: str, lang_code: str):
-    JOBS[job_id]["message"] = f"Loading Faster-Whisper ({model_size}, int8)..."
-    model = get_whisper_model(model_size)
+def run_local_whisper_original_srt(job_id: str, audio_path: str, output_srt: str, model_size: str, lang_code: str):
+    JOBS[job_id]["message"] = f"Loading Local Faster-Whisper ({model_size}, int8)..."
+    model = get_local_whisper_model(model_size)
 
-    JOBS[job_id]["message"] = "Transcribing original language with accurate timestamps (No API Key)..."
+    JOBS[job_id]["message"] = "Local Faster-Whisper ဖြင့် မူရင်းဘာသာ .srt ထုတ်နေပါသည်..."
     language_arg = lang_code.strip() if lang_code and lang_code.strip() else None
 
     segments, info = model.transcribe(
@@ -176,11 +217,9 @@ def run_whisper_original_srt(job_id: str, audio_path: str, output_srt: str, mode
         beam_size=5,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
-        word_timestamps=True  # <--- အရေးကြီးဆုံး ပြင်ဆင်ချက် (စကားလုံးအလိုက် အချိန်ယူရန်)
     )
 
     total_dur = max(info.duration, 1.0)
-    JOBS[job_id]["detected_lang"] = info.language
     idx = 1
 
     with open(output_srt, "w", encoding="utf-8") as f:
@@ -188,28 +227,14 @@ def run_whisper_original_srt(job_id: str, audio_path: str, output_srt: str, mode
             text = seg.text.strip()
             if not text:
                 continue
-            
-            start_time = seg.start
-            end_time = seg.end
+            start_ts = seconds_to_srt_time(seg.start)
+            end_ts = seconds_to_srt_time(seg.end)
+            block = f"{idx}
+{start_ts} --> {end_ts}
+{text}"
+            f.write(block + "
 
-            # စကားလုံးတွေရဲ့ အတိအကျ အဆုံးသတ်ချိန်ကို ယူမယ်
-            if hasattr(seg, 'words') and seg.words:
-                end_time = seg.words[-1].end
-                
-                # စာတန်းဖတ်ရလွယ်ကူအောင် အနည်းဆုံး ၀.၅ စက္ကန့် ထားပေးမယ်
-                if end_time - start_time < 0.5:
-                    end_time = start_time + 0.5
-                
-                # စကားပြောပြီးတာနဲ့ ချက်ချင်းပျောက်သွားအောင် 0.15 စက္ကန့် (150ms) လျှော့ချပစ်မယ်
-                # ဒါမှ စာတန်းတွေ ကပ်မနေဘဲ ကွက်လပ်လေး ပေါ်လာမှာပါ
-                if end_time - start_time > 0.8:
-                    end_time -= 0.15 
-
-            start_ts = seconds_to_srt_time(start_time)
-            end_ts = seconds_to_srt_time(end_time)
-            
-            block = f"{idx}\n{start_ts} --> {end_ts}\n{text}"
-            f.write(block + "\n\n")
+")
             f.flush()
 
             pct = min(95, int((seg.end / total_dur) * 100))
@@ -218,40 +243,130 @@ def run_whisper_original_srt(job_id: str, audio_path: str, output_srt: str, mode
             idx += 1
 
 
-def run_gemini_srt_translation(job_id: str, input_srt: str, output_srt: str, api_key: str, model_name: str, hint: str):
-    from google import genai
-    from google.genai import types
+# =====================================================================
+# 5. MYANMAR .SRT TRANSLATION (GROQ LLAMA-3.3-70B OR GEMINI)
+# =====================================================================
 
-    client = genai.Client(api_key=api_key)
+def translate_srt_with_groq(
+    job_id: str,
+    input_srt: str,
+    output_srt: str,
+    groq_api_key: str,
+    groq_llm_model: str = "llama-3.3-70b-versatile",
+    hint: str = ""
+):
+    """Translate Original .srt blocks into Myanmar Unicode using Groq Chat Completions."""
+    from groq import Groq
+
+    client = Groq(api_key=groq_api_key)
     with open(input_srt, "r", encoding="utf-8-sig") as f:
         content = f.read().strip()
 
-    blocks = re.split(r"\n\s*\n", content)
+    blocks = re.split(r"
+\s*
+", content)
+    total_blocks = len(blocks)
+    batch_size = 40  # Smaller batch size for Groq token limits and faster responses
+    translated_batches: List[str] = []
+
+    for start in range(0, total_blocks, batch_size):
+        batch = blocks[start : start + batch_size]
+        batch_text = "
+
+".join(batch)
+        batch_num = (start // batch_size) + 1
+        total_batches = (total_blocks + batch_size - 1) // batch_size
+
+        JOBS[job_id]["message"] = f"Groq ({groq_llm_model}) ဖြင့် မြန်မာဘာသာပြန်နေပါသည် (Batch {batch_num}/{total_batches})..."
+        JOBS[job_id]["progress"] = min(98, int((start / max(total_blocks, 1)) * 100))
+
+        user_prompt = (
+            "Translate the following .srt subtitle blocks into natural colloquial Burmese (Myanmar Unicode). "
+            "Keep the exact index numbers and timestamps unchanged:
+
+"
+            f"{batch_text}"
+        )
+        if hint:
+            user_prompt = f"Movie Context: {hint}
+
+" + user_prompt
+
+        for attempt in range(1, 4):
+            try:
+                completion = client.chat.completions.create(
+                    model=groq_llm_model,
+                    messages=[
+                        {"role": "system", "content": SRT_TRANSLATE_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.2,
+                )
+                reply = completion.choices[0].message.content or ""
+                translated_batches.append(clean_llm_srt_output(reply))
+                break
+            except Exception as e:
+                if attempt == 3:
+                    raise RuntimeError(f"Groq Translation Error: {e}")
+                time.sleep(3 * attempt)
+
+        with open(output_srt, "w", encoding="utf-8") as f:
+            f.write("
+
+".join(translated_batches) + "
+")
+
+
+def translate_srt_with_gemini(
+    job_id: str,
+    input_srt: str,
+    output_srt: str,
+    gemini_api_key: str,
+    gemini_model: str = "gemini-2.5-flash",
+    hint: str = ""
+):
+    """Translate Original .srt blocks into Myanmar Unicode using Gemini API."""
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=gemini_api_key)
+    with open(input_srt, "r", encoding="utf-8-sig") as f:
+        content = f.read().strip()
+
+    blocks = re.split(r"
+\s*
+", content)
     total_blocks = len(blocks)
     batch_size = 60
     translated_batches: List[str] = []
 
     for start in range(0, total_blocks, batch_size):
         batch = blocks[start : start + batch_size]
-        batch_text = "\n\n".join(batch)
+        batch_text = "
+
+".join(batch)
         batch_num = (start // batch_size) + 1
         total_batches = (total_blocks + batch_size - 1) // batch_size
 
-        JOBS[job_id]["message"] = f"Gemini ဖြင့် မြန်မာဘာသာပြန်နေပါသည် (Batch {batch_num}/{total_batches})..."
+        JOBS[job_id]["message"] = f"Gemini ({gemini_model}) ဖြင့် မြန်မာဘာသာပြန်နေပါသည် (Batch {batch_num}/{total_batches})..."
         JOBS[job_id]["progress"] = min(98, int((start / max(total_blocks, 1)) * 100))
 
         prompt = (
             "Translate the following .srt subtitle blocks into natural colloquial Burmese (Myanmar Unicode). "
-            "Keep the exact index numbers and timestamps unchanged:\n\n"
+            "Keep the exact index numbers and timestamps unchanged:
+
+"
             f"{batch_text}"
         )
         if hint:
-            prompt = f"Movie Context: {hint}\n\n" + prompt
+            prompt = f"Movie Context: {hint}
+
+" + prompt
 
         for attempt in range(1, 4):
             try:
                 response = client.models.generate_content(
-                    model=model_name,
+                    model=gemini_model,
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         system_instruction=SRT_TRANSLATE_SYSTEM_PROMPT,
@@ -266,109 +381,78 @@ def run_gemini_srt_translation(job_id: str, input_srt: str, output_srt: str, api
                 time.sleep(3 * attempt)
 
         with open(output_srt, "w", encoding="utf-8") as f:
-            f.write("\n\n".join(translated_batches) + "\n")
+            f.write("
 
-
-def run_gemini_direct_video_to_mm(job_id: str, audio_path: str, work_dir: Path, output_srt: str, api_key: str, model_name: str, hint: str):
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(api_key=api_key)
-    chunk_seconds = 600
-    pattern = str(work_dir / "chunk_%04d.mp3")
-
-    cmd = [
-        "ffmpeg", "-y", "-i", audio_path,
-        "-f", "segment", "-segment_time", str(chunk_seconds),
-        "-c", "copy", pattern
-    ]
-    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-    chunk_files = sorted(glob.glob(str(work_dir / "chunk_*.mp3")))
-
-    all_blocks: List[str] = []
-    next_idx = 1
-
-    for i, cpath in enumerate(chunk_files):
-        offset_ms = i * chunk_seconds * 1000
-        JOBS[job_id]["message"] = f"Gemini Direct Audio->MM (Chunk {i+1}/{len(chunk_files)})..."
-        JOBS[job_id]["progress"] = int(((i) / max(len(chunk_files), 1)) * 95)
-
-        uploaded = client.files.upload(file=cpath)
-        try:
-            while uploaded.state.name == "PROCESSING":
-                time.sleep(2)
-                uploaded = client.files.get(name=uploaded.name)
-
-            prompt = (
-                "Generate accurate Myanmar (Burmese Unicode) subtitles in standard .srt format "
-                "for all spoken dialogue in this audio clip. Start timestamps from 00:00:00,000."
-            )
-            if hint:
-                prompt += f"\nContext: {hint}"
-
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=[uploaded, prompt],
-                config=types.GenerateContentConfig(
-                    system_instruction=AUDIO_TO_MM_SRT_SYSTEM_PROMPT,
-                    temperature=0.2,
-                ),
-            )
-            adj_blocks, next_idx = parse_and_offset_srt(resp.text or "", offset_ms, next_idx)
-            all_blocks.extend(adj_blocks)
-
-            with open(output_srt, "w", encoding="utf-8") as f:
-                f.write("\n\n".join(all_blocks) + "\n")
-        finally:
-            try:
-                client.files.delete(name=uploaded.name)
-            except Exception:
-                pass
+".join(translated_batches) + "
+")
 
 
 # =====================================================================
-# 3. BACKGROUND WORKER THREAD
+# 6. BACKGROUND WORKER THREAD
 # =====================================================================
 
 def background_worker(job_id: str, params: Dict[str, Any]):
     work_dir = JOBS_DIR / job_id
     try:
         input_path = Path(params["input_path"])
-        mode = params["mode"]
-        whisper_model = params["whisper_model"]
+        mode = params["mode"]                     # "original", "both", "myanmar"
+        stt_engine = params["stt_engine"]         # "groq_whisper" or "local_whisper"
+        translate_engine = params["translate_engine"]  # "groq_llm" or "gemini"
         lang = params["lang"]
-        gemini_model = params["gemini_model"]
         hint = params["hint"]
-        api_key = params["api_key"]
+        groq_api_key = params["groq_api_key"]
+        gemini_api_key = params["gemini_api_key"]
         stem = params["orig_stem"]
 
         ext = input_path.suffix.lower()
 
+        # Case 1: Uploaded file is already an .srt -> Translate to Myanmar
         if ext == ".srt":
             mm_srt = str(work_dir / f"{stem}_mm.srt")
-            run_gemini_srt_translation(job_id, str(input_path), mm_srt, api_key, gemini_model, hint)
+            if translate_engine == "groq_llm":
+                translate_srt_with_groq(job_id, str(input_path), mm_srt, groq_api_key, "llama-3.3-70b-versatile", hint)
+            else:
+                translate_srt_with_gemini(job_id, str(input_path), mm_srt, gemini_api_key, "gemini-2.5-flash", hint)
             JOBS[job_id]["mm_srt"] = mm_srt
+
+        # Case 2: Video/Audio input
         else:
             JOBS[job_id]["message"] = "FFmpeg ဖြင့် အသံထုတ်ယူနေပါသည်..."
             audio_mp3 = str(work_dir / "extracted_audio.mp3")
             extract_lightweight_audio(str(input_path), audio_mp3)
 
-            if mode == "original":
-                orig_srt = str(work_dir / f"{stem}_orig.srt")
-                run_whisper_original_srt(job_id, audio_mp3, orig_srt, whisper_model, lang)
+            orig_srt = str(work_dir / f"{stem}_orig.srt")
+
+            # Step 1: Transcribe Original Language .SRT (Groq Whisper OR Local Faster-Whisper)
+            if stt_engine == "groq_whisper":
+                run_groq_whisper_original_srt(
+                    job_id=job_id,
+                    audio_mp3=audio_mp3,
+                    work_dir=work_dir,
+                    output_srt=orig_srt,
+                    groq_api_key=groq_api_key,
+                    groq_whisper_model="whisper-large-v3-turbo",
+                    lang_code=lang,
+                )
+            else:
+                run_local_whisper_original_srt(
+                    job_id=job_id,
+                    audio_path=audio_mp3,
+                    output_srt=orig_srt,
+                    model_size=os.environ.get("WHISPER_MODEL", "small"),
+                    lang_code=lang,
+                )
+
+            if mode in ["original", "both"]:
                 JOBS[job_id]["orig_srt"] = orig_srt
 
-            elif mode == "both":
-                orig_srt = str(work_dir / f"{stem}_orig.srt")
+            # Step 2: If Myanmar output is requested, translate the generated Original .SRT
+            if mode in ["both", "myanmar"]:
                 mm_srt = str(work_dir / f"{stem}_mm.srt")
-                run_whisper_original_srt(job_id, audio_mp3, orig_srt, whisper_model, lang)
-                JOBS[job_id]["orig_srt"] = orig_srt
-                run_gemini_srt_translation(job_id, orig_srt, mm_srt, api_key, gemini_model, hint)
-                JOBS[job_id]["mm_srt"] = mm_srt
-
-            elif mode == "myanmar":
-                mm_srt = str(work_dir / f"{stem}_mm.srt")
-                run_gemini_direct_video_to_mm(job_id, audio_mp3, work_dir, mm_srt, api_key, gemini_model, hint)
+                if translate_engine == "groq_llm":
+                    translate_srt_with_groq(job_id, orig_srt, mm_srt, groq_api_key, "llama-3.3-70b-versatile", hint)
+                else:
+                    translate_srt_with_gemini(job_id, orig_srt, mm_srt, gemini_api_key, "gemini-2.5-flash", hint)
                 JOBS[job_id]["mm_srt"] = mm_srt
 
         JOBS[job_id]["status"] = "completed"
@@ -381,7 +465,7 @@ def background_worker(job_id: str, params: Dict[str, Any]):
 
 
 # =====================================================================
-# 4. WEB UI & REST API ENDPOINTS
+# 7. WEB UI & REST API ENDPOINTS
 # =====================================================================
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -389,14 +473,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Subtitle Generator Pro (Render Paid Plan)</title>
+  <title>Subtitle Generator Pro v2 (Groq + Gemini + Render)</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-900 text-slate-100 min-h-screen p-6">
   <div class="max-w-2xl mx-auto bg-slate-800 rounded-2xl shadow-xl p-8 border border-slate-700">
-    <h1 class="text-2xl font-bold text-emerald-400 mb-2">🎬 Subtitle Generator Pro (Render Edition)</h1>
+    <h1 class="text-2xl font-bold text-emerald-400 mb-2">⚡ Subtitle Generator v2 (Groq & Gemini Edition)</h1>
     <p class="text-sm text-slate-400 mb-6">
-      မူရင်းဘာသာစကား (.srt) ကို API Key မလိုဘဲ Faster-Whisper ဖြင့် အခမဲ့ထုတ်ယူနိုင်ပြီး၊ မြန်မာဘာသာ (.srt) အတွက် Gemini API သုံးနိုင်ပါသည်။
+      Groq API (<code>whisper-large-v3-turbo</code> & <code>llama-3.3-70b</code>)၊ Local Whisper နှင့် Gemini API တို့ကို စိတ်ကြိုက်တွဲဖက်သုံးနိုင်ပါသည်။
     </p>
 
     <form id="uploadForm" class="space-y-4">
@@ -406,22 +490,41 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           class="w-full text-sm bg-slate-900 border border-slate-700 rounded-lg p-2.5" />
       </div>
 
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div>
           <label class="block text-sm font-medium mb-1">2. Output Mode</label>
-          <select name="mode" id="modeSelect" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm">
-            <option value="original">Original Language .SRT (API Key မလိုပါ)</option>
-            <option value="both">Both (Original + Myanmar .SRT)</option>
-            <option value="myanmar">Myanmar .SRT Only (Gemini Direct)</option>
+          <select name="mode" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm">
+            <option value="original">Original .SRT သီးသန့်</option>
+            <option value="both" selected>Both (Original + Myanmar .SRT)</option>
+            <option value="myanmar">Myanmar .SRT သီးသန့်</option>
           </select>
         </div>
         <div>
-          <label class="block text-sm font-medium mb-1">Whisper Model Size (Local RAM)</label>
-          <select name="whisper_model" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm">
-            <option value="base">base (Starter 512MB RAM အတွက်)</option>
-            <option value="small" selected>small (Standard 2GB RAM အတွက် - အကြံပြု)</option>
-            <option value="medium">medium (Pro 4GB+ RAM အတွက်)</option>
+          <label class="block text-sm font-medium mb-1">3. Audio -> Original Engine</label>
+          <select name="stt_engine" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm">
+            <option value="groq_whisper" selected>⚡ Groq Whisper Turbo (အမြန်ဆုံး)</option>
+            <option value="local_whisper">💻 Local Faster-Whisper (No API Key)</option>
           </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">4. Myanmar Translator</label>
+          <select name="translate_engine" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm">
+            <option value="groq_llm">⚡ Groq (Llama-3.3-70B)</option>
+            <option value="gemini" selected>✨ Gemini 2.5 Flash (မြန်မာစာ အကောင်းဆုံး)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1">Groq API Key (gsk_...)</label>
+          <input type="password" name="groq_api_key" placeholder="Server ENV တွင်ထည့်ထားပါက မလိုပါ"
+            class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">Gemini API Key (Optional)</label>
+          <input type="password" name="gemini_api_key" placeholder="Gemini သုံးမှသာ လိုအပ်ပါသည်"
+            class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm" />
         </div>
       </div>
 
@@ -432,16 +535,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm" />
         </div>
         <div>
-          <label class="block text-sm font-medium mb-1">Gemini API Key (မြန်မာဘာသာအတွက်သာ)</label>
-          <input type="password" name="api_key" placeholder="Server ENV တွင်ထည့်ထားပါက မလိုပါ"
+          <label class="block text-sm font-medium mb-1">Movie Context Hint (Optional)</label>
+          <input type="text" name="hint" placeholder="e.g. Chinese Wuxia drama, Action thriller"
             class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm" />
         </div>
-      </div>
-
-      <div>
-        <label class="block text-sm font-medium mb-1">Movie Context Hint (Optional)</label>
-        <input type="text" name="hint" placeholder="e.g. Chinese Wuxia drama, Action thriller"
-          class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm" />
       </div>
 
       <button type="submit" id="submitBtn"
@@ -540,16 +637,26 @@ def start_job():
     if not f.filename:
         return jsonify({"error": "ဖိုင်အမည် မရှိပါ။"}), 400
 
-    mode = request.form.get("mode", "original")
-    whisper_model = request.form.get("whisper_model", os.environ.get("WHISPER_MODEL", "small"))
+    mode = request.form.get("mode", "both")
+    stt_engine = request.form.get("stt_engine", "groq_whisper")
+    translate_engine = request.form.get("translate_engine", "groq_llm")
     lang = request.form.get("lang", "")
     hint = request.form.get("hint", "")
-    gemini_model = request.form.get("gemini_model", "gemini-2.5-flash")
-    api_key = request.form.get("api_key", "").strip() or os.environ.get("GEMINI_API_KEY", "")
+
+    groq_api_key = request.form.get("groq_api_key", "").strip() or os.environ.get("GROQ_API_KEY", "")
+    gemini_api_key = request.form.get("gemini_api_key", "").strip() or os.environ.get("GEMINI_API_KEY", "")
 
     orig_path = Path(f.filename)
-    if (mode in ["myanmar", "both"] or orig_path.suffix.lower() == ".srt") and not api_key:
-        return jsonify({"error": "မြန်မာဘာသာပြန်ဆိုရန် GEMINI_API_KEY လိုအပ်ပါသည်။ (မူရင်းဘာသာသီးသန့်အတွက် Original Mode ကို ရွေးပါ)"}), 400
+    is_srt = orig_path.suffix.lower() == ".srt"
+
+    if not is_srt and stt_engine == "groq_whisper" and not groq_api_key:
+        return jsonify({"error": "Groq Whisper သုံးရန် GROQ_API_KEY လိုအပ်ပါသည်။"}), 400
+
+    if (mode in ["both", "myanmar"] or is_srt):
+        if translate_engine == "groq_llm" and not groq_api_key:
+            return jsonify({"error": "Groq ဖြင့် မြန်မာဘာသာပြန်ရန် GROQ_API_KEY လိုအပ်ပါသည်။"}), 400
+        if translate_engine == "gemini" and not gemini_api_key:
+            return jsonify({"error": "Gemini ဖြင့် မြန်မာဘာသာပြန်ရန် GEMINI_API_KEY လိုအပ်ပါသည်။"}), 400
 
     job_id = uuid.uuid4().hex[:12]
     work_dir = JOBS_DIR / job_id
@@ -570,11 +677,12 @@ def start_job():
         "input_path": str(saved_input),
         "orig_stem": orig_path.stem,
         "mode": mode,
-        "whisper_model": whisper_model,
+        "stt_engine": stt_engine,
+        "translate_engine": translate_engine,
         "lang": lang,
-        "gemini_model": gemini_model,
         "hint": hint,
-        "api_key": api_key,
+        "groq_api_key": groq_api_key,
+        "gemini_api_key": gemini_api_key,
     }
 
     t = threading.Thread(target=background_worker, args=(job_id, params), daemon=True)
