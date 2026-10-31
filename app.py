@@ -176,6 +176,7 @@ def run_whisper_original_srt(job_id: str, audio_path: str, output_srt: str, mode
         beam_size=5,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=500),
+        word_timestamps=True  # <--- အရေးကြီးဆုံး ပြင်ဆင်ချက် (စကားလုံးအလိုက် အချိန်ယူရန်)
     )
 
     total_dur = max(info.duration, 1.0)
@@ -187,8 +188,26 @@ def run_whisper_original_srt(job_id: str, audio_path: str, output_srt: str, mode
             text = seg.text.strip()
             if not text:
                 continue
-            start_ts = seconds_to_srt_time(seg.start)
-            end_ts = seconds_to_srt_time(seg.end)
+            
+            start_time = seg.start
+            end_time = seg.end
+
+            # စကားလုံးတွေရဲ့ အတိအကျ အဆုံးသတ်ချိန်ကို ယူမယ်
+            if hasattr(seg, 'words') and seg.words:
+                end_time = seg.words[-1].end
+                
+                # စာတန်းဖတ်ရလွယ်ကူအောင် အနည်းဆုံး ၀.၅ စက္ကန့် ထားပေးမယ်
+                if end_time - start_time < 0.5:
+                    end_time = start_time + 0.5
+                
+                # စကားပြောပြီးတာနဲ့ ချက်ချင်းပျောက်သွားအောင် 0.15 စက္ကန့် (150ms) လျှော့ချပစ်မယ်
+                # ဒါမှ စာတန်းတွေ ကပ်မနေဘဲ ကွက်လပ်လေး ပေါ်လာမှာပါ
+                if end_time - start_time > 0.8:
+                    end_time -= 0.15 
+
+            start_ts = seconds_to_srt_time(start_time)
+            end_ts = seconds_to_srt_time(end_time)
+            
             block = f"{idx}\n{start_ts} --> {end_ts}\n{text}"
             f.write(block + "\n\n")
             f.flush()
